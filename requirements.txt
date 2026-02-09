@@ -1,0 +1,3 @@
+pywin32>=306
+watchdog>=4.0.0
+pyinstaller>=6.0
