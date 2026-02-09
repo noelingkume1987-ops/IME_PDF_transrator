@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for Excel to PDF Processor Pro.
+PyInstaller spec file for PLC Excel PDF Converter (16-Sheet).
 Usage:  pyinstaller build.spec
 """
 
@@ -14,9 +14,10 @@ a = Analysis(
         'win32com.client',
         'pythoncom',
         'pywintypes',
-        'watchdog',
-        'watchdog.observers',
-        'watchdog.events',
+        'pymcprotocol',
+        'config',
+        'plc_comm',
+        'core',
     ],
     hookspath=[],
     hooksconfig={},
@@ -33,7 +34,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ExcelPdfProcessorPro',
+    name='PLCExcelPdfConverter',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

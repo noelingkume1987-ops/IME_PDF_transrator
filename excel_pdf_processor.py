@@ -1,30 +1,33 @@
 """
-Excel to PDF Individual Sheet Processor (Pro Edition)
-=====================================================
-GUI application that monitors a folder for Excel files and converts
-each sheet to a separate PDF with timestamped filenames.
+PLC-linked Excel PDF Converter – GUI Application (16-sheet edition)
+===================================================================
+Windows resident application with tkinter GUI.
 
-Requirements:
-    - Windows OS with Microsoft Excel installed
-    - Python 3.10+ (or standalone EXE)
-
-Dependencies:
-    - pywin32 (win32com for Excel automation)
-    - watchdog (file system monitoring)
+Features:
+    - Folder path configuration (Input / Output / Archive)
+    - PLC connection settings (IP, port, device addresses)
+    - Start/Stop control for PLC monitoring
+    - Live status indicators (Heartbeat, Ready, Busy, Error)
+    - Scrollable log viewer
+    - Settings persistence via JSON config file
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import sys
-import logging
+import threading
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-from core import FolderMonitor
+from config import AppConfig
+from core import PLCExcelController
 
 
 # ---------------------------------------------------------------------------
-# GUI logging handler
+# GUI logging handler  (thread-safe → schedules writes on main thread)
 # ---------------------------------------------------------------------------
 
 class TextHandlerWidget(logging.Handler):
@@ -36,7 +39,6 @@ class TextHandlerWidget(logging.Handler):
 
     def emit(self, record):
         msg = self.format(record)
-        # Schedule UI update on the main thread
         self.text_widget.after(0, self._append, msg)
 
     def _append(self, msg: str):
@@ -51,249 +53,311 @@ class TextHandlerWidget(logging.Handler):
 # ---------------------------------------------------------------------------
 
 class ExcelPdfProcessorApp:
-    """Main application window."""
+    """PLC-linked Excel PDF Converter – main window."""
 
-    APP_TITLE = "Excel to PDF Processor Pro"
-    DEFAULT_INTERVAL = 10  # seconds
-    MIN_INTERVAL = 1
-    MAX_INTERVAL = 36000
+    APP_TITLE = "PLC Excel PDF Converter (16-Sheet)"
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(self.APP_TITLE)
-        self.root.geometry("780x620")
-        self.root.minsize(700, 550)
+        self.root.geometry("850x720")
+        self.root.minsize(800, 680)
         self.root.resizable(True, True)
 
-        # State
-        self.watch_dir = tk.StringVar()
-        self.output_dir = tk.StringVar()
-        self.interval_var = tk.IntVar(value=self.DEFAULT_INTERVAL)
-        self.monitor: FolderMonitor | None = None
+        # Load persisted config (or defaults)
+        self.cfg = AppConfig.load()
+
+        # Tkinter variables bound to config
+        self.input_folder_var = tk.StringVar(value=self.cfg.input_folder)
+        self.output_folder_var = tk.StringVar(value=self.cfg.output_folder)
+        self.archive_folder_var = tk.StringVar(value=self.cfg.archive_folder)
+        self.plc_ip_var = tk.StringVar(value=self.cfg.plc_ip)
+        self.plc_port_var = tk.IntVar(value=self.cfg.plc_port)
+        self.cmd_device_var = tk.StringVar(value=self.cfg.command_device)
+        self.cmp_device_var = tk.StringVar(value=self.cfg.complete_device)
+        self.mon_device_var = tk.StringVar(value=self.cfg.monitor_device)
 
         # Logger
-        self.logger = logging.getLogger("ExcelPdfProcessor")
+        self.logger = logging.getLogger("PLCExcelPDF")
         self.logger.setLevel(logging.DEBUG)
+
+        # Controller
+        self.controller: PLCExcelController | None = None
 
         self._build_ui()
         self._setup_logging()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # -- UI construction -----------------------------------------------------
+    # =================================================================
+    # UI construction
+    # =================================================================
 
     def _build_ui(self):
-        # Style
         style = ttk.Style()
-        style.configure("Status.TLabel", font=("", 11, "bold"))
+        style.configure("Status.TLabel", font=("", 10, "bold"))
+        style.configure("Indicator.TLabel", font=("", 10))
 
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 6, "pady": 3}
 
-        # --- Folder settings frame ---
-        folder_frame = ttk.LabelFrame(self.root, text="Folder Settings / フォルダ設定")
+        # ---- Folder settings ----
+        folder_frame = ttk.LabelFrame(self.root, text="フォルダ設定 / Folder Settings")
         folder_frame.pack(fill="x", **pad)
 
-        # Watch folder
-        ttk.Label(folder_frame, text="Watch Folder / 監視フォルダ:").grid(
-            row=0, column=0, sticky="w", **pad
-        )
-        ttk.Entry(folder_frame, textvariable=self.watch_dir, width=50).grid(
-            row=0, column=1, sticky="ew", **pad
-        )
-        ttk.Button(folder_frame, text="Browse...", command=self._browse_watch).grid(
-            row=0, column=2, **pad
-        )
-
-        # Output folder
-        ttk.Label(folder_frame, text="Output Folder / 出力先フォルダ:").grid(
-            row=1, column=0, sticky="w", **pad
-        )
-        ttk.Entry(folder_frame, textvariable=self.output_dir, width=50).grid(
-            row=1, column=1, sticky="ew", **pad
-        )
-        ttk.Button(folder_frame, text="Browse...", command=self._browse_output).grid(
-            row=1, column=2, **pad
-        )
-
+        self._folder_row(folder_frame, 0, "作業中フォルダ (Input):", self.input_folder_var)
+        self._folder_row(folder_frame, 1, "PDF出力先 (Output):", self.output_folder_var)
+        self._folder_row(folder_frame, 2, "Excel保存用 (Archive):", self.archive_folder_var)
         folder_frame.columnconfigure(1, weight=1)
 
-        # --- Interval settings frame ---
-        interval_frame = ttk.LabelFrame(
-            self.root, text="Monitoring Interval / 監視スパン (seconds)"
-        )
-        interval_frame.pack(fill="x", **pad)
+        # ---- PLC connection settings ----
+        plc_frame = ttk.LabelFrame(self.root, text="PLC接続設定 / PLC Connection")
+        plc_frame.pack(fill="x", **pad)
 
-        self.interval_slider = ttk.Scale(
-            interval_frame,
-            from_=self.MIN_INTERVAL,
-            to=self.MAX_INTERVAL,
-            orient="horizontal",
-            variable=self.interval_var,
-            command=self._on_slider_change,
-        )
-        self.interval_slider.grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Label(plc_frame, text="IP:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(plc_frame, textvariable=self.plc_ip_var, width=18).grid(
+            row=0, column=1, sticky="w", **pad)
 
-        vcmd = (self.root.register(self._validate_interval), "%P")
-        self.interval_entry = ttk.Spinbox(
-            interval_frame,
-            from_=self.MIN_INTERVAL,
-            to=self.MAX_INTERVAL,
-            textvariable=self.interval_var,
-            width=8,
-            validate="key",
-            validatecommand=vcmd,
-        )
-        self.interval_entry.grid(row=0, column=1, **pad)
-        ttk.Label(interval_frame, text="sec").grid(row=0, column=2, sticky="w")
+        ttk.Label(plc_frame, text="Port:").grid(row=0, column=2, sticky="w", **pad)
+        ttk.Entry(plc_frame, textvariable=self.plc_port_var, width=8).grid(
+            row=0, column=3, sticky="w", **pad)
 
-        interval_frame.columnconfigure(0, weight=1)
+        ttk.Label(plc_frame, text="指令 (Cmd):").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(plc_frame, textvariable=self.cmd_device_var, width=8).grid(
+            row=1, column=1, sticky="w", **pad)
 
-        # --- Control frame ---
+        ttk.Label(plc_frame, text="完了 (Cmp):").grid(row=1, column=2, sticky="w", **pad)
+        ttk.Entry(plc_frame, textvariable=self.cmp_device_var, width=8).grid(
+            row=1, column=3, sticky="w", **pad)
+
+        ttk.Label(plc_frame, text="モニタ (Mon):").grid(row=1, column=4, sticky="w", **pad)
+        ttk.Entry(plc_frame, textvariable=self.mon_device_var, width=8).grid(
+            row=1, column=5, sticky="w", **pad)
+
+        # ---- Status indicators ----
+        status_frame = ttk.LabelFrame(self.root, text="ステータス / Status")
+        status_frame.pack(fill="x", **pad)
+
+        self.lbl_heartbeat = ttk.Label(status_frame, text="Heartbeat: --",
+                                        style="Indicator.TLabel")
+        self.lbl_heartbeat.grid(row=0, column=0, **pad)
+
+        self.lbl_ready = ttk.Label(status_frame, text="Ready: --",
+                                    style="Indicator.TLabel")
+        self.lbl_ready.grid(row=0, column=1, **pad)
+
+        self.lbl_busy = ttk.Label(status_frame, text="Busy: --",
+                                   style="Indicator.TLabel")
+        self.lbl_busy.grid(row=0, column=2, **pad)
+
+        self.lbl_error = ttk.Label(status_frame, text="Error: --",
+                                    style="Indicator.TLabel")
+        self.lbl_error.grid(row=0, column=3, **pad)
+
+        self.lbl_connection = ttk.Label(status_frame, text="PLC: 未接続",
+                                         foreground="gray", style="Status.TLabel")
+        self.lbl_connection.grid(row=0, column=4, **pad)
+
+        self.lbl_file_count = ttk.Label(status_frame, text="Files: --",
+                                         style="Indicator.TLabel")
+        self.lbl_file_count.grid(row=0, column=5, **pad)
+
+        # ---- Control buttons ----
         ctrl_frame = ttk.Frame(self.root)
         ctrl_frame.pack(fill="x", **pad)
 
         self.start_btn = ttk.Button(
-            ctrl_frame, text="Start Monitoring / 監視開始", command=self._start_monitoring
-        )
+            ctrl_frame, text="接続・監視開始 / Start", command=self._start)
         self.start_btn.pack(side="left", **pad)
 
         self.stop_btn = ttk.Button(
-            ctrl_frame,
-            text="Stop Monitoring / 監視停止",
-            command=self._stop_monitoring,
-            state="disabled",
-        )
+            ctrl_frame, text="停止 / Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", **pad)
 
-        # Status indicator
-        self.status_label = ttk.Label(
-            ctrl_frame, text="● STOPPED / 停止中", foreground="gray", style="Status.TLabel"
-        )
-        self.status_label.pack(side="right", **pad)
+        self.save_btn = ttk.Button(
+            ctrl_frame, text="設定保存 / Save Config", command=self._save_config)
+        self.save_btn.pack(side="right", **pad)
 
-        # --- Log frame ---
-        log_frame = ttk.LabelFrame(self.root, text="Log / ログ")
+        # ---- Log ----
+        log_frame = ttk.LabelFrame(self.root, text="ログ / Log")
         log_frame.pack(fill="both", expand=True, **pad)
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, state="disabled", wrap="word", font=("Consolas", 9)
-        )
+            log_frame, state="disabled", wrap="word", font=("Consolas", 9))
         self.log_text.pack(fill="both", expand=True, **pad)
 
-        # Log clear button
         ttk.Button(log_frame, text="Clear Log", command=self._clear_log).pack(
-            anchor="e", **pad
-        )
+            anchor="e", **pad)
 
-    # -- Logging setup -------------------------------------------------------
+    def _folder_row(self, parent, row: int, label: str, var: tk.StringVar):
+        pad = {"padx": 6, "pady": 3}
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", **pad)
+        ttk.Entry(parent, textvariable=var, width=55).grid(
+            row=row, column=1, sticky="ew", **pad)
+        ttk.Button(parent, text="参照...",
+                   command=lambda: self._browse_folder(var)).grid(
+            row=row, column=2, **pad)
+
+    def _browse_folder(self, var: tk.StringVar):
+        d = filedialog.askdirectory()
+        if d:
+            var.set(d)
+
+    # =================================================================
+    # Logging setup
+    # =================================================================
 
     def _setup_logging(self):
         handler = TextHandlerWidget(self.log_text)
         handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-        )
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                              datefmt="%H:%M:%S"))
         self.logger.addHandler(handler)
 
-        # Also log to stderr for debugging
         stderr_handler = logging.StreamHandler(sys.stderr)
         stderr_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        )
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         self.logger.addHandler(stderr_handler)
 
-    # -- Callbacks -----------------------------------------------------------
+    # =================================================================
+    # Config sync
+    # =================================================================
 
-    def _browse_watch(self):
-        d = filedialog.askdirectory(title="Select Watch Folder / 監視フォルダを選択")
-        if d:
-            self.watch_dir.set(d)
-
-    def _browse_output(self):
-        d = filedialog.askdirectory(title="Select Output Folder / 出力先フォルダを選択")
-        if d:
-            self.output_dir.set(d)
-
-    def _on_slider_change(self, _value):
-        # Slider gives float; round to int
-        self.interval_var.set(int(float(_value)))
-        if self.monitor and self.monitor.is_running():
-            self.monitor.update_interval(self.interval_var.get())
-
-    @staticmethod
-    def _validate_interval(value: str) -> bool:
-        if value == "":
-            return True
+    def _sync_config_from_gui(self):
+        """Copy GUI variable values into the AppConfig object."""
+        self.cfg.input_folder = self.input_folder_var.get().strip()
+        self.cfg.output_folder = self.output_folder_var.get().strip()
+        self.cfg.archive_folder = self.archive_folder_var.get().strip()
+        self.cfg.plc_ip = self.plc_ip_var.get().strip()
         try:
-            int(value)
-            return True
-        except ValueError:
-            return False
+            self.cfg.plc_port = int(self.plc_port_var.get())
+        except (ValueError, tk.TclError):
+            self.cfg.plc_port = 5000
+        self.cfg.command_device = self.cmd_device_var.get().strip()
+        self.cfg.complete_device = self.cmp_device_var.get().strip()
+        self.cfg.monitor_device = self.mon_device_var.get().strip()
 
-    def _start_monitoring(self):
-        watch = self.watch_dir.get().strip()
-        output = self.output_dir.get().strip()
+    def _save_config(self):
+        self._sync_config_from_gui()
+        path = self.cfg.save()
+        self.logger.info("Config saved: %s", path)
 
-        if not watch:
-            messagebox.showwarning(
-                self.APP_TITLE,
-                "Please select a watch folder.\n監視フォルダを選択してください。",
-            )
+    # =================================================================
+    # Start / Stop
+    # =================================================================
+
+    def _validate_folders(self) -> bool:
+        for name, var in [
+            ("作業中フォルダ (Input)", self.input_folder_var),
+            ("PDF出力先 (Output)", self.output_folder_var),
+            ("Excel保存用 (Archive)", self.archive_folder_var),
+        ]:
+            val = var.get().strip()
+            if not val:
+                messagebox.showwarning(self.APP_TITLE,
+                                       f"{name} を設定してください。")
+                return False
+        # Create output & archive if they don't exist
+        os.makedirs(self.output_folder_var.get().strip(), exist_ok=True)
+        os.makedirs(self.archive_folder_var.get().strip(), exist_ok=True)
+        return True
+
+    def _start(self):
+        if not self._validate_folders():
             return
-        if not output:
-            messagebox.showwarning(
-                self.APP_TITLE,
-                "Please select an output folder.\n出力先フォルダを選択してください。",
+
+        self._sync_config_from_gui()
+
+        try:
+            self.controller = PLCExcelController(
+                config=self.cfg,
+                logger=self.logger,
+                on_error=self._on_plc_error,
+                on_status=self._on_status_update,
             )
+            self.controller.start()
+        except Exception as e:
+            self.logger.exception("Failed to start controller")
+            messagebox.showerror(self.APP_TITLE,
+                                 f"PLC接続に失敗しました:\n{e}")
             return
-        if not os.path.isdir(watch):
-            messagebox.showerror(
-                self.APP_TITLE, f"Watch folder does not exist:\n{watch}"
-            )
-            return
 
-        os.makedirs(output, exist_ok=True)
-
-        interval = self.interval_var.get()
-        if interval < self.MIN_INTERVAL:
-            interval = self.MIN_INTERVAL
-            self.interval_var.set(interval)
-
-        self.monitor = FolderMonitor(
-            watch_dir=watch,
-            output_dir=output,
-            interval=interval,
-            logger=self.logger,
-            on_status_change=self._update_status_indicator,
-            on_file_processed=self._on_file_processed,
-        )
-        self.monitor.start()
-
+        self.lbl_connection.configure(text="PLC: 接続中", foreground="green")
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.interval_slider.configure(state="normal")
+        self._save_config()
+        self.logger.info("System started.")
 
-    def _stop_monitoring(self):
-        if self.monitor:
-            self.monitor.stop()
+        # Start periodic status refresh
+        self._refresh_status()
+
+    def _stop(self):
+        if self.controller:
+            self.controller.stop()
+            self.controller = None
+
+        self.lbl_connection.configure(text="PLC: 未接続", foreground="gray")
+        self.lbl_heartbeat.configure(text="Heartbeat: --")
+        self.lbl_ready.configure(text="Ready: --")
+        self.lbl_busy.configure(text="Busy: --")
+        self.lbl_error.configure(text="Error: --")
+        self.lbl_file_count.configure(text="Files: --")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.logger.info("System stopped.")
 
-    def _update_status_indicator(self, running: bool):
-        if running:
-            self.status_label.configure(
-                text="● MONITORING / 監視中", foreground="green"
-            )
-        else:
-            self.status_label.configure(
-                text="● STOPPED / 停止中", foreground="gray"
-            )
+    # =================================================================
+    # Callbacks (called from worker threads – must schedule on main)
+    # =================================================================
 
-    def _on_file_processed(self, filepath: str, success: bool, pdfs: list[str]):
-        name = os.path.basename(filepath)
-        if success:
-            self.logger.info(f"Completed / 完了: {name} ({len(pdfs)} PDF(s))")
-        else:
-            self.logger.error(f"Failed / 失敗: {name}")
+    def _on_plc_error(self, message: str):
+        """Show error popup from worker thread."""
+        self.root.after(0, lambda: messagebox.showerror("Error / エラー", message))
+
+    def _on_status_update(self, status: dict):
+        """Update status labels from status dict."""
+        def _update():
+            if "ready" in status:
+                self.lbl_ready.configure(
+                    text=f"Ready: {'ON' if status['ready'] else 'OFF'}",
+                    foreground="green" if status["ready"] else "gray")
+            if "file_count" in status:
+                self.lbl_file_count.configure(
+                    text=f"Files: {status['file_count']}")
+        self.root.after(0, _update)
+
+    def _refresh_status(self):
+        """Periodically read D2 from PLC and update indicator labels."""
+        if self.controller and self.controller.is_running:
+            try:
+                plc = self.controller._plc
+                if plc and plc.is_connected:
+                    val = plc.read_word(self.cfg.monitor_device)
+
+                    hb = bool(val & (1 << 0))
+                    rdy = bool(val & (1 << 1))
+                    bsy = bool(val & (1 << 2))
+                    err = bool(val & (1 << 3))
+
+                    self.lbl_heartbeat.configure(
+                        text=f"Heartbeat: {'ON' if hb else 'OFF'}",
+                        foreground="green" if hb else "gray")
+                    self.lbl_ready.configure(
+                        text=f"Ready: {'ON' if rdy else 'OFF'}",
+                        foreground="green" if rdy else "gray")
+                    self.lbl_busy.configure(
+                        text=f"Busy: {'ON' if bsy else 'OFF'}",
+                        foreground="orange" if bsy else "gray")
+                    self.lbl_error.configure(
+                        text=f"Error: {'ON' if err else 'OFF'}",
+                        foreground="red" if err else "gray")
+            except Exception:
+                pass  # PLC read may fail transiently
+
+            self.root.after(500, self._refresh_status)
+
+    # =================================================================
+    # Misc
+    # =================================================================
 
     def _clear_log(self):
         self.log_text.configure(state="normal")
@@ -301,20 +365,21 @@ class ExcelPdfProcessorApp:
         self.log_text.configure(state="disabled")
 
     def _on_close(self):
-        if self.monitor and self.monitor.is_running():
+        if self.controller and self.controller.is_running:
             if not messagebox.askyesno(
                 self.APP_TITLE,
-                "Monitoring is running. Quit anyway?\n監視中です。終了しますか？",
-            ):
+                "PLC監視中です。終了しますか？\nMonitoring is active. Quit?"):
                 return
-            self.monitor.stop()
+            self.controller.stop()
         self.root.destroy()
 
-    # -- Entry point ---------------------------------------------------------
+    # =================================================================
+    # Entry point
+    # =================================================================
 
     def run(self):
-        self.logger.info(f"{self.APP_TITLE} started.")
-        self.logger.info("Select folders and click 'Start Monitoring'.")
+        self.logger.info("%s started.", self.APP_TITLE)
+        self.logger.info("フォルダとPLC設定を行い、「接続・監視開始」を押してください。")
         self.root.mainloop()
 
 
