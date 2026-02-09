@@ -26,7 +26,8 @@ from core import (
     archive_excel_file,
 )
 
-from config import AppConfig
+from config import AppConfig, hash_password
+from plc_comm import MockPLCConnection
 
 
 # =====================================================================
@@ -94,7 +95,7 @@ class TestExcelExtensions(unittest.TestCase):
 
 
 # =====================================================================
-# Bit-field decoding  (D0 command word → sheet indices)
+# Bit-field decoding  (D0 command word -> sheet indices)
 # =====================================================================
 
 class TestDecodeSheetBits(unittest.TestCase):
@@ -102,19 +103,19 @@ class TestDecodeSheetBits(unittest.TestCase):
         self.assertEqual(decode_sheet_bits(0x0000), [])
 
     def test_single_bit_0(self):
-        """Bit 0 → sheet index 0 (= Sheet 1)"""
+        """Bit 0 -> sheet index 0 (= Sheet 1)"""
         self.assertEqual(decode_sheet_bits(0x0001), [0])
 
     def test_single_bit_15(self):
-        """Bit 15 → sheet index 15 (= Sheet 16)"""
+        """Bit 15 -> sheet index 15 (= Sheet 16)"""
         self.assertEqual(decode_sheet_bits(0x8000), [15])
 
     def test_multiple_bits(self):
-        # bits 0, 2, 4 → indices [0, 2, 4]
+        # bits 0, 2, 4 -> indices [0, 2, 4]
         self.assertEqual(decode_sheet_bits(0b0000_0000_0001_0101), [0, 2, 4])
 
     def test_all_bits(self):
-        """All 16 bits ON → indices 0..15"""
+        """All 16 bits ON -> indices 0..15"""
         self.assertEqual(decode_sheet_bits(0xFFFF), list(range(16)))
 
     def test_high_byte_only(self):
@@ -227,13 +228,12 @@ class TestArchiveExcelFile(unittest.TestCase):
             f.write("data")
         dest = archive_excel_file(src, self.archive_dir, self.logger)
         basename = os.path.basename(dest)
-        # Should contain original stem + timestamp + extension
         self.assertTrue(basename.startswith("report_"))
         self.assertTrue(basename.endswith(".xlsx"))
 
 
 # =====================================================================
-# AppConfig  (JSON persistence)
+# AppConfig  (JSON persistence + password + auto_start)
 # =====================================================================
 
 class TestAppConfig(unittest.TestCase):
@@ -244,6 +244,7 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(cfg.command_device, "D0")
         self.assertEqual(cfg.complete_device, "D1")
         self.assertEqual(cfg.monitor_device, "D2")
+        self.assertTrue(cfg.auto_start)
 
     def test_save_and_load(self):
         cfg = AppConfig(plc_ip="10.0.0.1", input_folder="/tmp/input")
@@ -254,7 +255,6 @@ class TestAppConfig(unittest.TestCase):
             loaded = AppConfig.load(path)
             self.assertEqual(loaded.plc_ip, "10.0.0.1")
             self.assertEqual(loaded.input_folder, "/tmp/input")
-            # Unchanged defaults should persist
             self.assertEqual(loaded.plc_port, 5000)
         finally:
             os.unlink(path)
@@ -264,7 +264,6 @@ class TestAppConfig(unittest.TestCase):
         self.assertEqual(cfg.plc_ip, "192.168.1.10")
 
     def test_ignores_unknown_keys(self):
-        """Extra keys in JSON should not cause errors."""
         import json
         with tempfile.NamedTemporaryFile(
             suffix=".json", delete=False, mode="w"
@@ -278,8 +277,127 @@ class TestAppConfig(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAppConfigPassword(unittest.TestCase):
+    def test_default_password_is_0000(self):
+        cfg = AppConfig()
+        self.assertTrue(cfg.verify_password("0000"))
+
+    def test_wrong_password_rejected(self):
+        cfg = AppConfig()
+        self.assertFalse(cfg.verify_password("1234"))
+
+    def test_change_password(self):
+        cfg = AppConfig()
+        cfg.change_password("newpw")
+        self.assertTrue(cfg.verify_password("newpw"))
+        self.assertFalse(cfg.verify_password("0000"))
+
+    def test_password_survives_save_load(self):
+        cfg = AppConfig()
+        cfg.change_password("secret123")
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            cfg.save(path)
+            loaded = AppConfig.load(path)
+            self.assertTrue(loaded.verify_password("secret123"))
+            self.assertFalse(loaded.verify_password("0000"))
+        finally:
+            os.unlink(path)
+
+    def test_hash_password_deterministic(self):
+        h1 = hash_password("test")
+        h2 = hash_password("test")
+        self.assertEqual(h1, h2)
+
+    def test_hash_password_different_inputs(self):
+        h1 = hash_password("abc")
+        h2 = hash_password("xyz")
+        self.assertNotEqual(h1, h2)
+
+
+class TestAppConfigAutoStart(unittest.TestCase):
+    def test_default_auto_start_true(self):
+        cfg = AppConfig()
+        self.assertTrue(cfg.auto_start)
+
+    def test_auto_start_persists(self):
+        cfg = AppConfig(auto_start=False)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            cfg.save(path)
+            loaded = AppConfig.load(path)
+            self.assertFalse(loaded.auto_start)
+        finally:
+            os.unlink(path)
+
+
 # =====================================================================
-# PLCConnection  (mock-based tests)
+# MockPLCConnection
+# =====================================================================
+
+class TestMockPLCConnection(unittest.TestCase):
+    def test_connect_disconnect(self):
+        mock = MockPLCConnection()
+        self.assertFalse(mock.is_connected)
+        mock.connect()
+        self.assertTrue(mock.is_connected)
+        mock.disconnect()
+        self.assertFalse(mock.is_connected)
+
+    def test_read_write_word(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        self.assertEqual(mock.read_word("D0"), 0)
+        mock.write_word("D0", 0x1234)
+        self.assertEqual(mock.read_word("D0"), 0x1234)
+
+    def test_set_bit(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.set_bit("D2", 3)
+        self.assertEqual(mock.read_word("D2"), 0x0008)
+
+    def test_clear_bit(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.write_word("D2", 0x000F)
+        mock.clear_bit("D2", 1)
+        self.assertEqual(mock.read_word("D2"), 0x000D)
+
+    def test_write_bits(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.write_word("D2", 0x0002)  # bit 1 ON
+        mock.write_bits("D2", bits_to_set=[2], bits_to_clear=[1])
+        self.assertEqual(mock.read_word("D2"), 0x0004)
+
+    def test_16bit_mask(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.write_word("D0", 0x1FFFF)  # > 16 bits
+        self.assertEqual(mock.read_word("D0"), 0xFFFF)
+
+    def test_independent_registers(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.write_word("D0", 100)
+        mock.write_word("D1", 200)
+        self.assertEqual(mock.read_word("D0"), 100)
+        self.assertEqual(mock.read_word("D1"), 200)
+
+    def test_disconnect_clears_registers(self):
+        mock = MockPLCConnection()
+        mock.connect()
+        mock.write_word("D0", 0xABCD)
+        mock.disconnect()
+        mock.connect()
+        self.assertEqual(mock.read_word("D0"), 0)
+
+
+# =====================================================================
+# PLCConnection  (real connection mock-based tests)
 # =====================================================================
 
 class TestPLCConnectionMock(unittest.TestCase):
@@ -288,7 +406,6 @@ class TestPLCConnectionMock(unittest.TestCase):
     def _make_connection(self):
         from plc_comm import PLCConnection
         conn = PLCConnection("192.168.1.10", 5000)
-        # Replace internal state to simulate connected
         mock_pymc = MagicMock()
         conn._pymc = mock_pymc
         conn._connected = True
@@ -318,15 +435,13 @@ class TestPLCConnectionMock(unittest.TestCase):
         conn, mock = self._make_connection()
         mock.batchread_wordunits.return_value = [0x000F]
         conn.clear_bit("D2", 1)
-        # 0x000F with bit 1 cleared = 0x000D
         mock.batchwrite_wordunits.assert_called_once_with(
             headdevice="D2", values=[0x000D])
 
     def test_write_bits_set_and_clear(self):
         conn, mock = self._make_connection()
-        mock.batchread_wordunits.return_value = [0x0002]  # bit 1 ON
+        mock.batchread_wordunits.return_value = [0x0002]
         conn.write_bits("D2", bits_to_set=[2], bits_to_clear=[1])
-        # bit 1 cleared, bit 2 set → 0x0004
         mock.batchwrite_wordunits.assert_called_once_with(
             headdevice="D2", values=[0x0004])
 
@@ -348,6 +463,15 @@ class TestSendOneshot(unittest.TestCase):
         send_oneshot(mock_plc, "D1", bit=1, duration_s=0.01)
         mock_plc.set_bit.assert_called_once_with("D1", 1)
         mock_plc.clear_bit.assert_called_once_with("D1", 1)
+
+    def test_oneshot_with_mock_plc(self):
+        """Test one-shot using real MockPLCConnection."""
+        from plc_comm import send_oneshot
+        mock = MockPLCConnection()
+        mock.connect()
+        send_oneshot(mock, "D1", bit=1, duration_s=0.01)
+        # After one-shot, the bit should be OFF
+        self.assertEqual(mock.read_word("D1"), 0)
 
 
 if __name__ == "__main__":

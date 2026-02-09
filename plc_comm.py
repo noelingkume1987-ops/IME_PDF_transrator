@@ -9,6 +9,9 @@ Device mapping (configurable):
     D1 (complete) : bit 1 = one-shot completion pulse (100 ms)
     D2 (monitor)  : bit 0 = heartbeat, bit 1 = ready,
                     bit 2 = busy, bit 3 = error
+
+Also provides ``MockPLCConnection`` – an in-memory stand-in used for
+test mode so the system can run without a physical PLC.
 """
 
 from __future__ import annotations
@@ -108,6 +111,71 @@ class PLCConnection:
 
 
 # =====================================================================
+# Mock PLC connection  (for test mode – no hardware required)
+# =====================================================================
+
+class MockPLCConnection:
+    """In-memory PLC simulator with the same API as ``PLCConnection``.
+
+    Stores D-register values in a dict so the conversion pipeline and
+    heartbeat can run without a real PLC.  Useful for offline testing.
+    """
+
+    def __init__(self):
+        self._registers: dict[str, int] = {}   # e.g. {"D0": 0, "D1": 0, ...}
+        self._lock = threading.Lock()
+        self._connected = False
+
+    def connect(self) -> None:
+        with self._lock:
+            self._connected = True
+        logger.info("MockPLC connected (test mode).")
+
+    def disconnect(self) -> None:
+        with self._lock:
+            self._connected = False
+            self._registers.clear()
+        logger.info("MockPLC disconnected.")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # -- word --
+
+    def read_word(self, device: str) -> int:
+        with self._lock:
+            return self._registers.get(device, 0) & 0xFFFF
+
+    def write_word(self, device: str, value: int) -> None:
+        with self._lock:
+            self._registers[device] = value & 0xFFFF
+
+    # -- bit --
+
+    def set_bit(self, device: str, bit: int) -> None:
+        with self._lock:
+            val = self._registers.get(device, 0)
+            val |= (1 << bit)
+            self._registers[device] = val & 0xFFFF
+
+    def clear_bit(self, device: str, bit: int) -> None:
+        with self._lock:
+            val = self._registers.get(device, 0)
+            val &= ~(1 << bit) & 0xFFFF
+            self._registers[device] = val & 0xFFFF
+
+    def write_bits(self, device: str, bits_to_set: list[int], bits_to_clear: list[int]) -> None:
+        with self._lock:
+            val = self._registers.get(device, 0)
+            for b in bits_to_set:
+                val |= (1 << b)
+            for b in bits_to_clear:
+                val &= ~(1 << b) & 0xFFFF
+            self._registers[device] = val & 0xFFFF
+
+
+# =====================================================================
 # Heartbeat helper
 # =====================================================================
 
@@ -116,7 +184,7 @@ class HeartbeatThread:
     the PC software is alive.
     """
 
-    def __init__(self, plc: PLCConnection, device: str, interval: float = 0.5):
+    def __init__(self, plc, device: str, interval: float = 0.5):
         self._plc = plc
         self._device = device
         self._interval = interval
@@ -157,7 +225,7 @@ class HeartbeatThread:
 # One-shot pulse helper
 # =====================================================================
 
-def send_oneshot(plc: PLCConnection, device: str, bit: int, duration_s: float = 0.1) -> None:
+def send_oneshot(plc, device: str, bit: int, duration_s: float = 0.1) -> None:
     """Set *bit* ON in *device*, wait *duration_s*, then set it OFF.
 
     Used for the completion pulse on D1.1.

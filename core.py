@@ -260,11 +260,13 @@ class PLCExcelController:
         logger: logging.Logger,
         on_error: callable | None = None,
         on_status: callable | None = None,
+        plc_connection=None,
     ):
         self.cfg = config
         self.logger = logger
         self.on_error = on_error      # callback(message: str)
         self.on_status = on_status    # callback(status_dict)
+        self._injected_plc = plc_connection  # None = create real, else use this
 
         self._plc: PLCConnection | None = None
         self._heartbeat: HeartbeatThread | None = None
@@ -277,8 +279,13 @@ class PLCExcelController:
 
     def start(self) -> None:
         """Connect to PLC and launch background threads."""
-        self._plc = PLCConnection(self.cfg.plc_ip, self.cfg.plc_port)
-        self._plc.connect()
+        if self._injected_plc is not None:
+            self._plc = self._injected_plc
+            if not self._plc.is_connected:
+                self._plc.connect()
+        else:
+            self._plc = PLCConnection(self.cfg.plc_ip, self.cfg.plc_port)
+            self._plc.connect()
 
         # Clear all output devices on start
         self._plc.write_word(self.cfg.complete_device, 0)

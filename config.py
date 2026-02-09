@@ -2,15 +2,24 @@
 Configuration management for PLC-linked Excel PDF Converter.
 =============================================================
 Persists settings (folder paths, PLC connection parameters, device
-addresses) to a JSON file so they survive application restarts.
+addresses, password) to a JSON file so they survive application restarts.
 """
 
 import json
 import os
+import hashlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 CONFIG_FILENAME = "plc_pdf_config.json"
+
+# Default password hash (SHA-256 of "0000")
+_DEFAULT_PW_HASH = hashlib.sha256("0000".encode()).hexdigest()
+
+
+def hash_password(plain: str) -> str:
+    """Return SHA-256 hex digest of *plain*."""
+    return hashlib.sha256(plain.encode()).hexdigest()
 
 
 @dataclass
@@ -27,9 +36,6 @@ class AppConfig:
     plc_port: int = 5000
 
     # --- PLC device addresses ---
-    #   command_device  : D register read as 16-bit word (e.g. "D0")
-    #   complete_device : D register for completion one-shot (e.g. "D1")
-    #   monitor_device  : D register for heartbeat/ready/busy/error (e.g. "D2")
     command_device: str = "D0"
     complete_device: str = "D1"
     monitor_device: str = "D2"
@@ -37,6 +43,24 @@ class AppConfig:
     # --- Timing ---
     plc_poll_interval: float = 0.2   # seconds – D0 polling cycle
     heartbeat_interval: float = 0.5  # seconds – D2.0 toggle cycle
+
+    # --- Security ---
+    password_hash: str = _DEFAULT_PW_HASH   # SHA-256 hash of settings password
+
+    # --- Auto-start ---
+    auto_start: bool = True  # automatically start monitoring on launch
+
+    # -----------------------------------------------------------------
+    # Password helpers
+    # -----------------------------------------------------------------
+
+    def verify_password(self, plain: str) -> bool:
+        """Return True if *plain* matches the stored password hash."""
+        return hash_password(plain) == self.password_hash
+
+    def change_password(self, new_plain: str) -> None:
+        """Update the stored password hash."""
+        self.password_hash = hash_password(new_plain)
 
     # -----------------------------------------------------------------
     # Serialisation helpers
