@@ -1,11 +1,11 @@
 @echo off
 REM ============================================================
-REM  Build script for Excel to PDF Processor Pro
+REM  Build script for PLC Excel PDF Converter (16-Sheet)
 REM  Creates a standalone .exe using PyInstaller
 REM ============================================================
 
 echo ============================================
-echo  Building Excel to PDF Processor Pro (EXE)
+echo  Building PLC Excel PDF Converter (EXE)
 echo ============================================
 
 REM Install dependencies
@@ -15,13 +15,17 @@ REM Build single-file executable
 pyinstaller ^
     --onefile ^
     --windowed ^
-    --name "ExcelPdfProcessorPro" ^
+    --name "PLCExcelPdfConverter" ^
     --add-data "README.md;." ^
+    --hidden-import pymcprotocol ^
+    --hidden-import config ^
+    --hidden-import plc_comm ^
+    --hidden-import core ^
     --noconfirm ^
     excel_pdf_processor.py
 
 echo.
 echo Build complete!
-echo Output: dist\ExcelPdfProcessorPro.exe
+echo Output: dist\PLCExcelPdfConverter.exe
 echo.
 pause
